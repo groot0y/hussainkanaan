@@ -1,0 +1,188 @@
+name: Build Android APK (Quran app)
+
+# Builds an installable test APK of quran-app/ and publishes it to a stable
+# GitHub Release for sideloading. The content DB is built fresh from the
+# pinned sources: fetch_sources.py downloads them and ingest.py refuses to
+# build unless they match sources.lock.json. Signed with Flutter's debug key
+# (no secrets), so Android warns it's from an unknown developer.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - claude/new-project-wfesil
+    paths:
+      - "quran-app/**"
+      - ".github/workflows/quran-app-android.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: quran-app-android
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: quran-app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      # Sources are pinned by sources.lock.json, so a cached copy is exactly
+      # as good as a fresh download, and builds don't depend on every
+      # upstream host being up.
+      - name: Restore sources
+        id: sources
+        uses: actions/cache@v4
+        with:
+          path: quran-app/tool/ingest/sources
+          key: ingest-sources-${{ hashFiles('quran-app/tool/ingest/sources.lock.json', 'quran-app/tool/ingest/fetch_sources.py', 'quran-app/tool/ingest/reciters.json', 'quran-app/tool/ingest/calendar/**', 'quran-app/tool/ingest/vendor/**') }}
+
+      - name: Download sources
+        if: steps.sources.outputs.cache-hit != 'true'
+        run: python3 tool/ingest/fetch_sources.py
+
+      - name: Build content DB
+        # The calendar pack is a draft until a qualified review (BLUEPRINT §9).
+        run: python3 tool/ingest/ingest.py --allow-unreviewed-calendar
+
+      - name: Render all 604 pages (Phase 1 gate)
+        run: |
+          flutter pub get
+          flutter test tool/screenshots/render_pages_test.dart --plain-name "all 604"
+
+      - name: Search on a cold DB (Phase 4 gate)
+        run: flutter test tool/screenshots/render_pages_test.dart --plain-name "search gate"
+
+      # The built-in reciter: Minshawi (murattal) as 16 kbps Opus, ~200 MB for
+      # the whole Quran. Cached, so only a change to the script or reciter
+      # re-downloads and re-encodes.
+      - name: Restore built-in reciter
+        id: bundled
+        uses: actions/cache@v4
+        with:
+          path: |
+            quran-app/assets/audio/bundled.json
+            quran-app/assets/audio/minshawi-murattal
+          # Only the encoder script decides the output; adding other reciters to
+          # reciters.json must not re-encode Minshawi.
+          key: bundled-audio-minshawi-murattal-16k-${{ hashFiles('quran-app/tool/audio/build_bundle.py') }}
+
+      - name: Build built-in reciter (download and encode)
+        if: steps.bundled.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          python3 tool/audio/build_bundle.py minshawi-murattal --kbps 16
+
+      - name: Build APK
+        run: |
+          flutter pub get
+          # A rising version, so each APK is a newer version of the last and
+          # update trackers (Obtainium) can tell builds apart.
+          # 64-bit ARM only: every current phone, and one copy of the engine
+          # instead of three.
+          flutter build apk --release --target-platform android-arm64 --build-name=1.0.${{ github.run_number }} --build-number=$((100 + ${{ github.run_number }}))
+          cp build/app/outputs/flutter-apk/app-release.apk quran-app.apk
+          ls -lh quran-app.apk
+
+      # Resource shrinking can't see resources looked up by name at runtime.
+      # A missing one silently breaks the media notification (it did once).
+      - name: Runtime-looked-up resources survived shrinking
+        run: |
+          AAPT2=$(ls -d $ANDROID_HOME/build-tools/*/aapt2 | sort -V | tail -1)
+          $AAPT2 dump resources quran-app.apk > res.txt
+          for r in drawable/ic_stat_quran drawable/audio_service_play_arrow drawable/audio_service_pause \
+                   drawable/audio_service_skip_next drawable/audio_service_skip_previous drawable/audio_service_stop; do
+            grep -q "resource .* $r" res.txt || { echo "missing from the APK: $r"; exit 1; }
+          done
+          echo "all runtime resources present"
+          test -f assets/audio/bundled.json && cat assets/audio/bundled.json
+          n=$(unzip -l quran-app.apk | grep -c 'flutter_assets/assets/audio/minshawi-murattal/.*\.opus' || true)
+          echo "bundled Opus files in the APK: $n"; test "$n" -eq 6236
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quran-app-apk
+          path: quran-app/quran-app.apk
+          if-no-files-found: error
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: quran-app-android-latest
+          name: "Quran app — Android test build"
+          body: |
+            Installable test build of the Quran app (Phases 1–6).
+
+            - Content DB built from the pinned sources (Tanzil + Quran Foundation), checked against `sources.lock.json`.
+            - Signed with a fixed test key, so each build installs as an update over the last. Android will warn it's from an unknown developer; allow installs from your browser/files app.
+
+            Commit: ${{ github.sha }}
+          files: quran-app/quran-app.apk
+          make_latest: "false"
+
+      # One release per build as well, named "Quran app 1.0.N", for Obtainium
+      # (it installs updates from these; filter release titles by "^Quran app").
+      - name: Publish versioned release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: quran-app-v1.0.${{ github.run_number }}
+          name: "Quran app 1.0.${{ github.run_number }}"
+          body: |
+            Test build 1.0.${{ github.run_number }} of the Quran app. Commit: ${{ github.sha }}
+          files: quran-app/quran-app.apk
+          make_latest: "false"
+
+      - name: Keep only the newest 5 versioned releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --repo "${{ github.repository }}" --limit 100 --json tagName,createdAt \
+            --jq '[.[] | select(.tagName | startswith("quran-app-v"))] | sort_by(.createdAt) | reverse | .[5:] | .[].tagName' |
+          while read -r tag; do gh release delete "$tag" --repo "${{ github.repository }}" --cleanup-tag --yes; done
+
+  # Phase 6 gates against an independent reference. Separate from the APK
+  # job so a network hiccup at the reference service never blocks a build.
+  reference:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: quran-app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Fetch reference times and dates (AlAdhan)
+        run: python3 tool/reference/fetch_reference.py build/reference.json
+
+      - name: Prayer times within a minute; Hijri dates exact (Phase 6 gates)
+        run: |
+          flutter pub get
+          flutter test tool/reference/reference_test.dart --reporter expanded

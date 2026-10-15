@@ -1,0 +1,456 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../../core/arabic_digits.dart';
+import '../../core/format.dart';
+import '../../core/platform.dart' as platform;
+import '../../data/models.dart';
+import '../../data/providers.dart';
+import '../../data/user_repository.dart';
+import '../common/surah_search.dart';
+import 'battery.dart';
+import 'downloads_screen.dart';
+import 'listen_providers.dart';
+import 'listen_queue.dart';
+import 'listen_session.dart';
+import 'sleep_timer.dart';
+
+/// Listen Mode: long, untouched, screen-off recitation (BLUEPRINT §3).
+/// A dark, low-information screen with big thumb-reachable controls.
+class ListenScreen extends ConsumerWidget {
+  const ListenScreen({super.key, this.startAt, this.plan = RepeatPlan.none});
+
+  /// Pre-selects where to start (e.g. from the reader).
+  final AyahRef? startAt;
+
+  /// E.g. exactly the ayat an a'maal recommends.
+  final RepeatPlan plan;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final dark = ThemeData(
+      fontFamily: platform.isWeb ? 'NotoSansArabic' : null,
+      brightness: Brightness.dark,
+      colorSchemeSeed: const Color(0xFF1B5E4A),
+      useMaterial3: true,
+    );
+    final ready = ref.watch(listenReadyProvider);
+    final snapshot = ref.watch(listenSnapshotProvider).value;
+    final active = snapshot != null && snapshot.stopped == null;
+    return Theme(
+      data: dark,
+      child: Scaffold(
+        appBar: AppBar(title: const Text('الاستماع')),
+        body: ready.when(
+          loading: () => const Center(child: CircularProgressIndicator()),
+          error: (e, _) => Center(child: Text('$e', textDirection: TextDirection.ltr)),
+          data: (handler) => handler == null
+              ? const _Unavailable()
+              : ListView(
+                  padding: const EdgeInsets.only(bottom: 24),
+                  children: [
+                    const NotificationCard(),
+                    const BatteryCard(),
+                    if (active) _NowPlaying(snapshot: snapshot) else _StartPanel(startAt: startAt, plan: plan, last: snapshot),
+                    if (active)
+                      Center(
+                        child: TextButton.icon(
+                          icon: const Icon(Icons.help_outline),
+                          label: const Text('لا تظهر عناصر التحكم على شاشة القفل؟'),
+                          onPressed: () => showControlsHelp(context),
+                        ),
+                      ),
+                  ],
+                ),
+        ),
+      ),
+    );
+  }
+}
+
+class _Unavailable extends StatelessWidget {
+  const _Unavailable();
+
+  @override
+  Widget build(BuildContext context) => const Center(
+        child: Padding(
+          padding: EdgeInsets.all(24),
+          child: Text('الاستماع متاح حاليًا على أندرويد وiOS، ويأتي إلى سطح المكتب في مرحلة لاحقة.',
+              textAlign: TextAlign.center),
+        ),
+      );
+}
+
+String tierLabel(String tier) => switch (tier) {
+      'A' => 'تمييز كلمة بكلمة',
+      'B' => 'تمييز الآية',
+      _ => 'صوت فقط',
+    };
+
+class _StartPanel extends ConsumerStatefulWidget {
+  const _StartPanel({this.startAt, this.plan = RepeatPlan.none, this.last});
+
+  final AyahRef? startAt;
+  final RepeatPlan plan;
+  final ListenSnapshot? last;
+
+  @override
+  ConsumerState<_StartPanel> createState() => _StartPanelState();
+}
+
+class _StartPanelState extends ConsumerState<_StartPanel> {
+  late AyahRef _from = widget.startAt ?? const AyahRef(1, 1);
+  String? _error;
+
+  Reciter? _selected(List<Reciter> reciters, ListenSettings settings) =>
+      reciters.where((r) => r.slug == settings.reciterSlug).firstOrNull ??
+      // The built-in reciter plays with nothing downloaded.
+      reciters.where((r) => r.slug == ref.read(bundledAudioProvider).value?.slug).firstOrNull ??
+      reciters.where((r) => r.slug == defaultReciterSlug).firstOrNull ??
+      reciters.firstOrNull;
+
+  Future<void> _start(Reciter r, AyahRef from) async {
+    setState(() => _error = null);
+    final handler = await ref.read(listenReadyProvider.future);
+    final settings = ref.read(listenSettingsProvider).value ?? const ListenSettings();
+    await requestNotificationPermission();
+    ref.invalidate(notificationPermissionProvider);
+    try {
+      await handler!.session!.setLevel(settings.level);
+      await handler.startListening(r, from, plan: widget.plan);
+    } on SurahNotDownloaded catch (e) {
+      final name = ref.read(surahsProvider).value?.where((s) => s.id == e.surah).firstOrNull?.nameAr ?? '';
+      setState(() => _error = 'سورة $name غير مُنزّلة بصوت هذا القارئ. نزّلها أولًا، فالتلاوة لا تُبث من الإنترنت.');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final reciters = ref.watch(recitersProvider).value ?? const <Reciter>[];
+    final settings = ref.watch(listenSettingsProvider).value ?? const ListenSettings();
+    final surahs = ref.watch(surahsProvider).value ?? const <Surah>[];
+    final saved = ref.watch(savedPlaybackProvider).value;
+    final reciter = _selected(reciters, settings);
+    final text = Theme.of(context).textTheme;
+    if (reciter == null) return const Center(child: CircularProgressIndicator());
+    final downloaded = ref.watch(downloadedSurahsProvider(reciter.slug)).value ?? const <int>{};
+    final surahName = surahs.where((s) => s.id == _from.surah).firstOrNull?.nameAr ?? '';
+    final ready = downloaded.contains(_from.surah);
+    final savedReciter = reciters.where((r) => r.id == saved?.reciterId).firstOrNull;
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        if (widget.last?.stopped case final reason?)
+          Padding(
+            padding: const EdgeInsets.only(top: 12),
+            child: Text(switch (reason) {
+              StopReason.sleepTimer => 'توقفت التلاوة بانتهاء مؤقت النوم.',
+              StopReason.endOfQuran => 'خُتمت التلاوة.',
+              StopReason.notDownloaded => 'توقفت التلاوة عند آخر سورة مُنزّلة.',
+              StopReason.user => 'أُوقفت التلاوة.',
+              StopReason.endOfRange => 'انتهت الآيات المختارة.',
+            }, style: text.bodyMedium),
+          ),
+        if (saved != null && savedReciter != null && downloaded.contains(saved.ayah.surah))
+          Card(
+            margin: const EdgeInsets.only(top: 12),
+            child: ListTile(
+              leading: const Icon(Icons.history),
+              title: const Text('متابعة الاستماع'),
+              subtitle: Text('سورة ${surahs.where((s) => s.id == saved.ayah.surah).firstOrNull?.nameAr ?? ''}'
+                  ' · الآية ${arabicDigits(saved.ayah.ayah)} · ${savedReciter.nameAr ?? savedReciter.name}'),
+              onTap: () => _start(savedReciter, saved.ayah),
+            ),
+          ),
+        const SizedBox(height: 12),
+        Card(
+          child: ListTile(
+            leading: const Icon(Icons.record_voice_over_outlined),
+            title: Text(reciter.nameAr ?? reciter.name),
+            subtitle: Text('${tierLabel(reciter.syncTier)} · ${sizeLabel(ref, reciter)}'),
+            trailing: const Icon(Icons.expand_more),
+            onTap: () async {
+              final picked = await showModalBottomSheet<Reciter>(
+                context: context,
+                builder: (_) => ReciterSheet(reciters: reciters, selected: reciter.slug),
+              );
+              if (picked != null) {
+                await ref.read(listenSettingsProvider.notifier).change((s) => s.copyWith(reciterSlug: picked.slug));
+              }
+            },
+          ),
+        ),
+        // The web streams everything: there are no downloads to manage.
+        if (!platform.isWeb)
+        Card(
+          child: ListTile(
+            leading: const Icon(Icons.download_outlined),
+            title: const Text('التنزيلات'),
+            subtitle: Text('${arabicDigits(downloaded.length)} من ${arabicDigits(surahs.length)} سورة مُنزّلة'),
+            trailing: const Icon(Icons.chevron_left),
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(builder: (_) => DownloadsScreen(reciter: reciter)),
+            ),
+          ),
+        ),
+        const SizedBox(height: 16),
+        Card(
+          child: ListTile(
+            minTileHeight: 72,
+            leading: const Icon(Icons.menu_book_outlined, size: 32),
+            title: Text('ابدأ من سورة $surahName', style: text.titleMedium),
+            subtitle: Text(
+              '${ready ? 'جاهزة للاستماع' : 'غير مُنزّلة بصوت هذا القارئ'} · اضغط للبحث عن سورة أخرى',
+            ),
+            trailing: const Icon(Icons.search),
+            onTap: () async {
+              final picked = await showSurahPicker(
+                context,
+                surahs: surahs,
+                title: 'من أي سورة تبدأ؟',
+                selected: _from.surah,
+                mark: (s) => downloaded.contains(s.id) ? 'جاهزة' : 'غير مُنزّلة',
+              );
+              if (picked != null) setState(() => _from = AyahRef(picked.id, 1));
+            },
+          ),
+        ),
+        Card(
+          child: ListTile(
+            leading: const Icon(Icons.format_list_numbered),
+            title: Text('من الآية ${arabicDigits(_from.ayah)}'),
+            subtitle: const Text('اضغط لاختيار آية أخرى'),
+            onTap: () async {
+              final count = surahs.where((s) => s.id == _from.surah).firstOrNull?.ayahCount ?? 1;
+              final ayah = await showDialog<int>(context: context, builder: (_) => _AyahDialog(count: count));
+              if (ayah != null) setState(() => _from = AyahRef(_from.surah, ayah));
+            },
+          ),
+        ),
+        const SizedBox(height: 16),
+        SizedBox(
+          height: 64,
+          child: FilledButton.icon(
+            icon: Icon(ready ? Icons.play_arrow : Icons.download),
+            label: Text(ready ? 'استمع من سورة $surahName حتى نهاية القرآن' : 'نزّل سورة $surahName أولًا'),
+            onPressed: ready
+                ? () => _start(reciter, _from)
+                : () => Navigator.of(context).push(
+                      MaterialPageRoute<void>(builder: (_) => DownloadsScreen(reciter: reciter)),
+                    ),
+          ),
+        ),
+        if (_error != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Text(_error!, style: TextStyle(color: Theme.of(context).colorScheme.error)),
+          ),
+      ]),
+    );
+  }
+}
+
+class ReciterSheet extends ConsumerWidget {
+  const ReciterSheet({super.key, required this.reciters, required this.selected});
+
+  final List<Reciter> reciters;
+  final String selected;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return SafeArea(
+      child: ListView(shrinkWrap: true, children: [
+        for (final r in reciters)
+          ListTile(
+            selected: r.slug == selected,
+            title: Text(r.nameAr ?? r.name),
+            subtitle: Text('${tierLabel(r.syncTier)} · ${sizeLabel(ref, r)}'),
+            trailing: r.slug == selected ? const Icon(Icons.check) : null,
+            onTap: () => Navigator.of(context).pop(r),
+          ),
+      ]),
+    );
+  }
+}
+
+class _NowPlaying extends ConsumerWidget {
+  const _NowPlaying({required this.snapshot});
+
+  final ListenSnapshot snapshot;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final surahs = ref.watch(surahsProvider).value ?? const <Surah>[];
+    final level = ref.watch(listenSettingsProvider).value?.level ?? 1.0;
+    final session = ref.watch(listenReadyProvider).value?.session;
+    final text = Theme.of(context).textTheme;
+    final surah = surahs.where((s) => s.id == snapshot.item.surah).firstOrNull;
+    final ayah = snapshot.item.isBismillah ? 'البسملة' : 'الآية ${arabicDigits(snapshot.item.ayah)}';
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        const SizedBox(height: 32),
+        Text('سورة ${surah?.nameAr ?? ''}', textAlign: TextAlign.center, style: text.displaySmall),
+        const SizedBox(height: 8),
+        Text(ayah, textAlign: TextAlign.center, style: text.titleLarge),
+        const SizedBox(height: 4),
+        Text(snapshot.reciter.nameAr ?? snapshot.reciter.name, textAlign: TextAlign.center, style: text.bodyMedium),
+        const SizedBox(height: 32),
+        Center(child: _SleepChip(snapshot: snapshot)),
+        const SizedBox(height: 24),
+        Row(children: [
+          const Icon(Icons.volume_down),
+          Expanded(
+            child: Slider(
+              value: level,
+              label: 'مستوى الصوت داخل التطبيق',
+              onChanged: (v) {
+                ref.read(listenSettingsProvider.notifier).change((s) => s.copyWith(level: v));
+                session?.setLevel(v);
+              },
+            ),
+          ),
+          const Icon(Icons.volume_up),
+        ]),
+        Text('لخفض الصوت دون أدنى مستوى في الهاتف، في الغرف الهادئة.',
+            textAlign: TextAlign.center, style: text.bodySmall),
+        const SizedBox(height: 32),
+        // RTL row: the previous ayah sits on the right, the next on the left.
+        Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
+          IconButton.filledTonal(
+            iconSize: 36,
+            tooltip: 'الآية السابقة',
+            icon: const Icon(Icons.skip_next),
+            onPressed: session?.previous,
+          ),
+          IconButton.filled(
+            iconSize: 56,
+            tooltip: snapshot.playing ? 'إيقاف مؤقت' : 'تشغيل',
+            icon: Icon(snapshot.playing ? Icons.pause : Icons.play_arrow),
+            onPressed: snapshot.playing ? session?.pause : session?.resume,
+          ),
+          IconButton.filledTonal(
+            iconSize: 36,
+            tooltip: 'الآية التالية',
+            icon: const Icon(Icons.skip_previous),
+            onPressed: session?.next,
+          ),
+        ]),
+        const SizedBox(height: 24),
+        TextButton.icon(
+          icon: const Icon(Icons.stop),
+          label: const Text('إنهاء التلاوة'),
+          onPressed: session?.stop,
+        ),
+      ]),
+    );
+  }
+}
+
+class _SleepChip extends ConsumerWidget {
+  const _SleepChip({required this.snapshot});
+
+  final ListenSnapshot snapshot;
+
+  static const _minutes = [15, 30, 45, 60, 90, 120];
+
+  String _label(Map<int, String> names) => switch (snapshot.sleep) {
+        SleepOff() => 'مؤقت النوم: متوقف',
+        SleepAfter() => 'يتوقف بعد ${formatDuration(snapshot.sleepRemaining ?? Duration.zero)}',
+        SleepEndOfSurah() || SleepAfterSurahs() => 'يتوقف بعد سورة ${names[snapshot.stopAfterSurah] ?? ''}',
+      };
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final surahs = ref.watch(surahsProvider).value ?? const <Surah>[];
+    final session = ref.watch(listenReadyProvider).value?.session;
+    final names = {for (final s in surahs) s.id: s.nameAr};
+    return ActionChip(
+      avatar: const Icon(Icons.bedtime_outlined),
+      label: Text(_label(names)),
+      onPressed: () async {
+        final choice = await showModalBottomSheet<SleepTimer>(
+          context: context,
+          builder: (_) => SafeArea(
+            child: ListView(shrinkWrap: true, children: [
+              for (final m in _minutes)
+                ListTile(
+                  title: Text('بعد ${formatDuration(Duration(minutes: m))}'),
+                  onTap: () => Navigator.pop(context, SleepAfter(Duration(minutes: m))),
+                ),
+              ListTile(
+                title: const Text('عند نهاية السورة الحالية'),
+                onTap: () => Navigator.pop(context, const SleepEndOfSurah()),
+              ),
+              for (final n in [2, 3, 5])
+                ListTile(
+                  title: Text('بعد ${arabicDigits(n)} سور (مع الحالية)'),
+                  onTap: () => Navigator.pop(context, SleepAfterSurahs(n)),
+                ),
+              ListTile(
+                title: const Text('بلا مؤقت'),
+                onTap: () => Navigator.pop(context, const SleepOff()),
+              ),
+            ]),
+          ),
+        );
+        if (choice != null) await session?.setSleep(choice);
+      },
+    );
+  }
+}
+
+/// "مضمّنة في التطبيق" for the built-in reciter, else the full download size.
+String sizeLabel(WidgetRef ref, Reciter r) => platform.isWeb
+    ? 'تُبث من الإنترنت'
+    : ref.watch(bundledAudioProvider).value?.slug == r.slug
+        ? 'مضمّنة في التطبيق، بلا تنزيل'
+        : 'كاملة ≈ ${formatBytes(r.approxBytes)}';
+
+/// Pick an ayah by number (Western or Arabic-Indic digits).
+class _AyahDialog extends StatefulWidget {
+  const _AyahDialog({required this.count});
+
+  final int count;
+
+  @override
+  State<_AyahDialog> createState() => _AyahDialogState();
+}
+
+class _AyahDialogState extends State<_AyahDialog> {
+  final _c = TextEditingController();
+  String? _error;
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    final n = parseNumber(_c.text);
+    if (n == null || n < 1 || n > widget.count) {
+      setState(() => _error = 'أدخل رقمًا من ١ إلى ${arabicDigits(widget.count)}');
+      return;
+    }
+    Navigator.of(context).pop(n);
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+        title: const Text('من أي آية؟'),
+        content: TextField(
+          controller: _c,
+          autofocus: true,
+          keyboardType: TextInputType.number,
+          decoration: InputDecoration(hintText: '١ – ${arabicDigits(widget.count)}', errorText: _error),
+          onSubmitted: (_) => _submit(),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
+          FilledButton(onPressed: _submit, child: const Text('تم')),
+        ],
+      );
+}
