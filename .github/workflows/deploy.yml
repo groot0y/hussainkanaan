@@ -1,0 +1,121 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+      - claude/beautiful-lovelace-rcjqT
+      - claude/upbeat-babbage-5CAxl
+  workflow_dispatch:
+  # The NGO preview is a static build of its database: rebuild regularly so
+  # content edits show up without a code push (Run workflow = rebuild now).
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent deployment, don't cancel in-progress runs.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up pnpm (NGO platform)
+        uses: pnpm/action-setup@v4
+        with:
+          package_json_file: ngo-platform/package.json
+
+      - name: Install portfolio dependencies
+        run: npm ci
+
+      - name: Install Expo web app dependencies
+        working-directory: golden-hour-explorer
+        run: npm ci
+
+      - name: Build Expo web app
+        working-directory: golden-hour-explorer
+        run: npx expo export --platform web --output-dir web-dist
+        env:
+          EXPO_NO_TELEMETRY: "1"
+
+      - name: Build NGO platform preview (static export)
+        working-directory: ngo-platform
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build:static
+        env:
+          NEXT_PUBLIC_BASE_PATH: /hussainkanaan/ngo-platform
+          NEXT_PUBLIC_SITE_URL: https://husseingpp.github.io/hussainkanaan/ngo-platform
+          # Shows the admin note that public pages update on the next rebuild.
+          NEXT_PUBLIC_STATIC_PREVIEW: "1"
+          # Public by design (the browser-side "publishable" key); RLS limits it to published content.
+          NEXT_PUBLIC_SUPABASE_URL: https://kgfyxsqfwtjxmbvqemsw.supabase.co
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: sb_publishable_Zcdfo3JSVN-w75_5nhAjQw_QLEVIQid
+          NEXT_TELEMETRY_DISABLED: "1"
+
+      - name: Build portfolio (static export)
+        run: npm run build
+
+      - name: Inject Expo web app into portfolio output
+        run: |
+          mkdir -p out/sunspot-app
+          cp -r golden-hour-explorer/web-dist/. out/sunspot-app/
+
+      - name: Inject café footfall report into portfolio output
+        run: |
+          mkdir -p out/cafe-footfall-tracker
+          cp -r cafe-footfall-tracker/docs/. out/cafe-footfall-tracker/
+
+      - name: Inject NGO platform preview into portfolio output
+        run: |
+          mkdir -p out/ngo-platform
+          cp -r ngo-platform/out/. out/ngo-platform/
+
+      # The Quran app's web build, published by quran-app-web.yml on the
+      # claude/new-project-wfesil branch as a release asset. Each rebuild
+      # (including the hourly one) picks up its latest version.
+      - name: Inject Quran app (web build) into portfolio output
+        run: |
+          mkdir -p out/quran
+          curl -sSfL -o quran-web.zip https://github.com/${{ github.repository }}/releases/download/quran-app-web-latest/quran-web.zip
+          unzip -q quran-web.zip -d out/quran
+          ls out/quran | head
+
+      - name: Disable Jekyll processing
+        run: touch out/.nojekyll
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
